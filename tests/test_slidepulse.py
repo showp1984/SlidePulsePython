@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tests
 """
 import importlib.util
 import json
+import shlex
 import socket
 import os
 import subprocess
@@ -30,11 +31,15 @@ class DeviceTestCase(unittest.TestCase):
         self.led.write_bytes(b"#ffffff\n")
         self.env = {"SLIDEPULSE_STATE_DIR": str(base / "state"), "SLIDEPULSE_DEVICE": str(self.device),
                     "SLIDEPULSE_NO_AGENT": "1"}
+        for variable in ("COPILOT_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "GRADLE_USER_HOME"):
+            self.env[variable] = str(base / variable.lower())  # never the real agent or Gradle settings
         self.saved = {k: os.environ.get(k) for k in self.env}
         os.environ.update(self.env)
+        self.real_studio_dirs, sp.studio_config_dirs = sp.studio_config_dirs, lambda: []  # never the real IDE
         self.cfg = sp.load_config()
 
     def tearDown(self):
+        sp.studio_config_dirs = self.real_studio_dirs
         for key, value in self.saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -66,6 +71,8 @@ class ProgramTests(DeviceTestCase):
             "4:#ff0000 250ms pulse 250ms;3:#ff0000 250ms pulse 375ms;2:#ff0000 250ms pulse 500ms;"
             "1:#ff0000 250ms pulse 625ms;0:#ff0000 125ms linear 750ms",
             "repeat", ""]))
+        self.assertEqual(sp.build_program("claude-working", self.cfg),
+                         "#ff5000 #4c1800 #140600\nroll 1s linear\nrepeat\n")
         installed = sp.build_program("installed", self.cfg).split("\n")
         self.assertEqual(installed[0], "#00e040 #000000")
         self.assertEqual(installed[3:], ["repeat 1", "off", ""])  # one sweep there and back, 1.75 s
@@ -135,6 +142,49 @@ class StateTests(DeviceTestCase):
         sp.apply("event", "build-failed", self.cfg, now=1005)
         with sp.locked_state() as state:
             self.assertEqual(state["held"], {})
+
+    def test_agent_working_input_done(self):
+        sp.apply("event", "claude-working", self.cfg, now=1000)
+        self.assertIn("#ff5000 #4c1800 #140600\nroll", self.shown())  # one way round
+        sp.apply("event", "claude-input", self.cfg, now=1001)
+        self.assertIn("1:#ff5000 250ms pulse", self.shown())  # back and forth until answered
+        sp.apply("event", "claude-working", self.cfg, now=1002)  # a tool ran after the approval
+        self.assertIn("roll", self.shown())
+        sp.apply("event", "claude-done", self.cfg, now=1003)
+        self.assertIn("#ff5000 1s pulse", self.shown())
+        with sp.locked_state() as state:
+            self.assertEqual(state["held"], {})
+            sp.render(state, self.cfg, 1006)
+        self.assertEqual(self.shown(), "off\n")
+
+    def test_agents_keep_their_own_states(self):
+        sp.apply("event", "grok-input", self.cfg, now=1000)
+        sp.apply("event", "chatgpt-working", self.cfg, now=1001)
+        self.assertIn("1:#ffffff 250ms pulse", self.shown())  # input outranks working
+        sp.apply("clear", "grok", self.cfg, now=1002)
+        self.assertIn("#10a37f", self.shown())
+        sp.apply("event", "chatgpt-done", self.cfg, now=1003)
+        with sp.locked_state() as state:
+            self.assertEqual(state["held"], {})
+
+    def test_most_recently_active_agent_shows(self):
+        sp.apply("event", "claude-working", self.cfg, now=1000)
+        sp.apply("event", "copilot-working", self.cfg, now=1001)
+        self.assertIn("#0064ff", self.shown())
+        sp.apply("event", "claude-working", self.cfg, now=1002)
+        self.assertIn("#ff5000", self.shown())
+
+    def test_refreshing_a_hold_lets_a_flash_finish(self):
+        sp.apply("event", "claude-working", self.cfg, now=1000)
+        sp.apply("event", "build-ok", self.cfg, now=1001)
+        sp.apply("event", "claude-working", self.cfg, now=1002)  # the next tool call
+        self.assertIn("#00e040 1s pulse", self.shown())
+
+    def test_working_expires_without_activity(self):
+        sp.apply("event", "claude-working", self.cfg, now=1000)
+        with sp.locked_state() as state:
+            sp.render(state, self.cfg, 1000 + self.cfg["working_seconds"] + 1)
+        self.assertEqual(self.shown(), "off\n")
 
     def test_held_states_expire(self):
         sp.apply("event", "crash", self.cfg, now=1000)
@@ -336,15 +386,39 @@ class AdbTests(unittest.TestCase):
 
 
 class InstallTests(DeviceTestCase):
-    def test_copilot_hooks_json(self):
-        doc = json.loads(sp.copilot_hooks_json())
+    def test_copilot_hooks(self):
+        doc = sp.agent_hooks("copilot")
         self.assertEqual(doc["version"], 1)
-        self.assertEqual(set(doc["hooks"]), set(sp.COPILOT_HOOKS))
+        self.assertEqual(set(doc["hooks"]), set(sp.AGENT_HOOKS["copilot"]))
         notification = doc["hooks"]["notification"][0]
         self.assertEqual(notification["matcher"], "permission_prompt|elicitation_dialog")
         self.assertEqual(notification["exec"], sys.executable)  # no shell, nothing to quote
-        self.assertEqual(notification["args"], ["-I", str(ROOT / "slidepulse.py"), "copilot", "notification"])
+        self.assertEqual(notification["args"],
+                         ["-I", str(ROOT / "slidepulse.py"), "hook", "copilot", "notification"])
         self.assertFalse({"bash", "powershell", "command"} & set(notification))
+
+    def test_claude_hooks_start_python_directly(self):
+        hooks = sp.agent_hooks("claude")["hooks"]
+        self.assertNotIn("Idle", hooks)  # an idle_prompt Notification hook, not an event of its own
+        self.assertEqual([g["matcher"] for g in hooks["Notification"]],
+                         ["permission_prompt|elicitation_dialog|elicitation_url_dialog", "idle_prompt"])
+        handler = hooks["Stop"][0]["hooks"][0]
+        self.assertEqual(handler["command"], sys.executable)
+        self.assertEqual(handler["args"], ["-I", str(ROOT / "slidepulse.py"), "hook", "claude", "Stop"])
+
+    def test_codex_and_grok_command_lines_quote_every_part(self):
+        for agent in ("chatgpt", "grok"):
+            for event, groups in sp.agent_hooks(agent)["hooks"].items():
+                for group in groups:
+                    argv = shlex.split(group["hooks"][0]["command"])
+                    self.assertEqual(argv[:5], [sys.executable, "-I", str(ROOT / "slidepulse.py"), "hook", agent])
+                    self.assertIn(argv[5], sp.AGENT_HOOKS[agent])
+        self.assertEqual(sp.shell_command(["/a b/py", "it's"]), "'/a b/py' 'it'\"'\"'s'")
+
+    def test_every_hook_key_has_a_meaning(self):
+        for agent, hooks in sp.AGENT_HOOKS.items():
+            for key, meaning in hooks.items():
+                self.assertIn(meaning, ("working", "input", "done", "off"), (agent, key))
 
     def test_groovy_quoting(self):
         self.assertEqual(sp.groovy_quote("C:\\it's"), "'C:\\\\it\\'s'")
@@ -356,22 +430,42 @@ class InstallTests(DeviceTestCase):
 
     def test_install_and_uninstall_in_temp_homes(self):
         base = Path(self.tmp.name)
-        os.environ["COPILOT_HOME"] = str(base / "copilot")
-        os.environ["GRADLE_USER_HOME"] = str(base / "gradle")
-        try:
-            studio = base / "AndroidStudio2099.1"
-            self.assertEqual(sp.install(False, str(studio)), 0)
-            files = [dest for _, dest, _ in sp.integration_files(studio)]
-            self.assertTrue(all(f.is_file() for f in files))
-            foreign = base / "gradle" / "init.d" / "slidepulse.gradle"
-            foreign.write_text("// someone else's script\n", encoding="utf-8")
-            self.assertEqual(sp.install(False, str(studio)), 1)  # refuses to overwrite it
-            sp.uninstall(str(studio))
-            self.assertTrue(foreign.exists())
-            self.assertFalse(any(f.exists() for f in files if f != foreign))
-        finally:
-            os.environ.pop("COPILOT_HOME")
-            os.environ.pop("GRADLE_USER_HOME")
+        studio = base / "AndroidStudio2099.1"
+        self.assertEqual(sp.install(False, str(studio)), 0)
+        files = [dest for _, dest, _ in sp.integration_files(studio)]
+        self.assertTrue(all(f.is_file() for f in files))
+        foreign = base / "gradle_user_home" / "init.d" / "slidepulse.gradle"
+        foreign.write_text("// someone else's script\n", encoding="utf-8")
+        self.assertEqual(sp.install(False, str(studio)), 1)  # refuses to overwrite it
+        sp.uninstall(str(studio))
+        self.assertTrue(foreign.exists())
+        self.assertFalse(any(f.exists() for f in files if f != foreign))
+        self.assertFalse(any(dest.exists() for _, dest, _ in sp.shared_hook_files()))  # held only ours
+
+    def test_shared_hook_files_keep_everything_else(self):
+        settings = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"
+        settings.parent.mkdir()
+        mine = {"attribution": {"commit": ""},
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say done"}]}]}}
+        settings.write_text(json.dumps(mine), encoding="utf-8")
+        studio = str(Path(self.tmp.name) / "AndroidStudio2099.1")
+        sp.install(False, studio)
+        sp.install(False, studio)  # again: replaces its hooks instead of adding a second set
+        doc = json.loads(settings.read_text(encoding="utf-8"))
+        self.assertEqual(doc["attribution"], {"commit": ""})
+        self.assertEqual(len(doc["hooks"]["Stop"]), 2)
+        self.assertEqual(doc["hooks"]["Stop"][0], mine["hooks"]["Stop"][0])
+        sp.uninstall(studio)
+        self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), mine)
+
+    def test_unreadable_shared_file_is_left_alone(self):
+        hooks = Path(os.environ["CODEX_HOME"]) / "hooks.json"
+        hooks.parent.mkdir()
+        hooks.write_text("{not json", encoding="utf-8")
+        studio = str(Path(self.tmp.name) / "AndroidStudio2099.1")
+        self.assertEqual(sp.install(False, studio), 1)
+        sp.uninstall(studio)
+        self.assertEqual(hooks.read_text(encoding="utf-8"), "{not json")
 
 
 class CliTests(DeviceTestCase):
@@ -391,6 +485,38 @@ class CliTests(DeviceTestCase):
         result = self.run_cli("copilot", "agentStop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_cli("copilot", "someFutureHook").returncode, 0)
+
+    def test_agent_hooks_from_cli(self):
+        self.assertEqual(self.run_cli("hook", "grok", "UserPromptSubmit").returncode, 0)
+        self.assertIn("#ffffff #4c4c4c #141414", self.shown())
+        self.assertEqual(self.run_cli("hook", "grok", "StopCancelled").returncode, 0)
+        self.assertEqual(self.shown(), "off\n")
+        self.assertEqual(self.run_cli("copilot", "userPromptSubmitted").returncode, 0)  # 1.1 hook files
+        self.assertIn("#0064ff #001e4c", self.shown())
+
+    def test_hooks_never_fail(self):
+        for args in (["hook", "claude", "SomeFutureEvent"], ["hook", "nobody", "Stop"], ["hook"],
+                     ["hook", "claude", "Stop", "extra"], ["event", "no-such-event"]):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 0, args)  # exit 2 would keep Claude, Codex or Grok going
+            self.assertEqual(result.stdout, "", args)  # Claude adds a hook's stdout to its context
+
+    def test_hook_exits_cleanly_when_stdin_stays_open(self):
+        process = subprocess.Popen([sys.executable, "-I", str(ROOT / "slidepulse.py"), "hook", "claude", "Stop"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env={**os.environ, **self.env})
+        try:
+            self.assertEqual(process.wait(timeout=10), 0)  # not an abort at interpreter shutdown
+            self.assertNotIn(b"Fatal Python error", process.stderr.read())
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_claude_hook_ignores_grok(self):
+        env = {**os.environ, **self.env, "GROK_HOOK_EVENT": "stop"}
+        self.assertEqual(self.run_cli("hook", "claude", "UserPromptSubmit", env=env).returncode, 0)
+        self.assertEqual(self.shown(), "#ffffff\n")
 
     def test_copilot_hook_drains_a_large_payload_quickly(self):
         started = time.monotonic()

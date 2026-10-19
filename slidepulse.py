@@ -12,7 +12,7 @@ server.
     python slidepulse.py clear breakpoint    end a held state
     python slidepulse.py demo                show every effect once
     python slidepulse.py status              device, agent and active states
-    python slidepulse.py install             wire up Copilot, Gradle and Android Studio
+    python slidepulse.py install             wire up AI agents, Gradle and Android Studio
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -31,7 +32,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCRIPT = Path(__file__).resolve()
 HERE = SCRIPT.parent
 CONFIG_PATH = HERE / "config.json"
@@ -51,44 +52,66 @@ AGENT_IDLE_EXIT = 1800               # agent exits after 30 idle minutes; the ne
 DEFAULTS = {
     "device": None,           # absolute drive/mount path or LEDS.LED path; None = auto-detect
     "brightness": 255,        # 1..255
-    "colors": {"copilot": "#0064ff", "build": "#00e040", "alert": "#ff0000"},
+    "colors": {"copilot": "#0064ff", "claude": "#ff5000", "chatgpt": "#10a37f", "grok": "#ffffff",
+               "build": "#00e040", "alert": "#ff0000"},
     "agent": True,            # the background agent draws, restores, expires and watches crashes
     "crash_watch": True,      # agent follows `logcat -b crash` through the running adb server
     "crash_seconds": 60,      # a crash stays visible this long unless a build/install clears it
     "crash_ignore": ["android.", "com.android.", "com.google.android.", "system_server"],
+    "working_seconds": 900,   # an AI agent's working light ends this long after its last activity
     "hold_max_seconds": 3600, # safety net: held states expire if nobody clears them
     "keepalive": None,        # touch the drive every minute; None = only on macOS
 }
 
 # "flash" plays for `seconds`, then the display returns to the highest held state.
 # "hold" stays until cleared, until a newer event replaces it, or until it expires.
+# Of two holds with the same priority, the one refreshed last (the most recently active agent) shows.
 EVENTS = {
-    "copilot-done":  {"kind": "flash", "color": "copilot", "style": "pulse", "seconds": 2,
-                      "clears": ["copilot-input"]},
-    "copilot-input": {"kind": "hold", "color": "copilot", "style": "run", "priority": 1},
     "build-ok":      {"kind": "flash", "color": "build", "style": "pulse", "seconds": 2,
                       "clears": ["crash"]},
     "build-failed":  {"kind": "flash", "color": "alert", "style": "blink", "seconds": 2,
                       "clears": ["crash"]},
-    "installed":     {"kind": "flash", "color": "build", "style": "run", "seconds": 2,
+    "installed":     {"kind": "flash", "color": "build", "style": "sweep", "seconds": 2,
                       "clears": ["crash"]},
-    "breakpoint":    {"kind": "hold", "color": "alert", "style": "run", "priority": 2},
+    "breakpoint":    {"kind": "hold", "color": "alert", "style": "sweep", "priority": 2},
     "crash":         {"kind": "hold", "color": "alert", "style": "fast", "priority": 3},
 }
+AGENTS = ("copilot", "claude", "chatgpt", "grok")
+for _agent in AGENTS:  # working: one-way running light; input: back and forth; done: two pulses
+    EVENTS[f"{_agent}-working"] = {"kind": "hold", "color": _agent, "style": "roll", "priority": 0,
+                                   "clears": [f"{_agent}-input"]}
+    EVENTS[f"{_agent}-input"] = {"kind": "hold", "color": _agent, "style": "sweep", "priority": 1}
+    EVENTS[f"{_agent}-done"] = {"kind": "flash", "color": _agent, "style": "pulse", "seconds": 2,
+                                "clears": [f"{_agent}-input", f"{_agent}-working"]}
 HOLDS = [name for name, ev in EVENTS.items() if ev["kind"] == "hold"]
-HOOK_COMMANDS = ("event", "clear", "copilot")
+HOOK_COMMANDS = ("event", "clear", "hook", "copilot")
 
-# Copilot CLI hook event -> slidepulse action. The installed `notification` hook has a
-# matcher, so it only fires for permission prompts and questions (elicitation dialogs).
-COPILOT_HOOKS = {
-    "agentStop": ("event", "copilot-done"),
-    "notification": ("event", "copilot-input"),
-    "userPromptSubmitted": ("clear", "copilot-input"),
-    "postToolUse": ("clear", "copilot-input"),
-    "postToolUseFailure": ("clear", "copilot-input"),
-    "sessionEnd": ("clear", "copilot-input"),
+# What each agent's hooks report. The key is what an installed hook passes to
+# `slidepulse.py hook <agent> <key>`, and also the agent's own event name for that hook (except
+# "Idle", a Notification hook for idle_prompt). A prompt or a finished tool call means working,
+# a permission prompt or question means input, the end of a turn means done, and an
+# interrupt, error or closed session turns the agent's light off.
+AGENT_HOOKS = {
+    "copilot": {"userPromptSubmitted": "working", "postToolUse": "working",
+                "postToolUseFailure": "working", "notification": "input", "agentStop": "done",
+                "sessionEnd": "off"},
+    "claude":  {"UserPromptSubmit": "working", "PostToolUse": "working", "PostToolUseFailure": "working",
+                "PermissionDenied": "working", "PermissionRequest": "input", "Notification": "input",
+                "Stop": "done", "StopFailure": "off", "Idle": "off", "SessionEnd": "off"},
+    "chatgpt": {"UserPromptSubmit": "working", "PostToolUse": "working", "PermissionRequest": "input",
+                "Stop": "done", "Interrupt": "off", "SessionEnd": "off"},
+    "grok":    {"UserPromptSubmit": "working", "PostToolUse": "working", "PostToolUseFailure": "working",
+                "PermissionDenied": "working", "Notification": "input", "Stop": "done",
+                "StopCancelled": "off", "StopFailure": "off", "Idle": "off", "SessionEnd": "off"},
 }
-COPILOT_INPUT_TYPES = "permission_prompt|elicitation_dialog"
+# Notification hooks fire for several types; these matchers pick the ones each key stands for.
+# Claude has no interrupt hook, so its idle_prompt (about a minute after a turn ends) clears it.
+HOOK_MATCHERS = {
+    "copilot": {"notification": "permission_prompt|elicitation_dialog"},
+    "claude":  {"Notification": "permission_prompt|elicitation_dialog|elicitation_url_dialog",
+                "Idle": "idle_prompt"},
+    "grok":    {"Notification": "permission_prompt", "Idle": "idle_prompt"},
+}
 
 # Environment the detached agent keeps. Tokens and passwords of whatever started it are dropped.
 AGENT_ENV = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE",
@@ -97,6 +120,7 @@ AGENT_ENV = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROF
              "SLIDEPULSE_DEVICE", "SLIDEPULSE_STATE_DIR"}
 
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}\Z")
+WINDOWS_WORD_RE = re.compile(r"[A-Za-z0-9_.:\\/-]+\Z")  # needs no quoting in cmd.exe or PowerShell
 PROGRAM_RE = re.compile(r"[A-Za-z0-9#:;./ \n-]*\Z")
 
 
@@ -144,7 +168,7 @@ def _valid_setting(key: str, value) -> bool:
         return value is None or (isinstance(value, str) and os.path.isabs(os.path.expanduser(value)))
     if key == "brightness":
         return type(value) is int and 1 <= value <= 255
-    if key in ("crash_seconds", "hold_max_seconds"):
+    if key in ("crash_seconds", "working_seconds", "hold_max_seconds"):
         return type(value) is int and 1 <= value <= 86400
     if key in ("agent", "crash_watch"):
         return type(value) is bool
@@ -185,7 +209,9 @@ def build_program(name: str, cfg: dict) -> str:
         lines = ["off", f"{color} 300ms pulse", "repeat"]
     elif ev["style"] == "blink":     # hard on/off flashes, 4 per second, then dark
         lines = [f"{color} 125ms none", "off 125ms none", f"repeat {seconds * 4}", "off"]
-    else:                            # "run": a light sweeping back and forth, one LED per 125 ms
+    elif ev["style"] == "roll":      # a comet running one way round the LEDs once per second
+        lines = [f"{color} {scale(color, 0.3)} {scale(color, 0.08)}", "roll 1s linear", "repeat"]
+    else:                            # "sweep": a light going back and forth, one LED per 125 ms
         last = LEDS - 1
         lines = [f"{color} #000000", sweep(range(LEDS), color), sweep(range(last, -1, -1), color)]
         if seconds:
@@ -440,7 +466,7 @@ def _desired(state: dict, cfg: dict, now: float):
         return f"flash:{flash['name']}:{flash['start']}", build_program(flash["name"], cfg)
     state["flash"] = None
     if state["held"]:
-        top = max(state["held"], key=lambda name: EVENTS[name]["priority"])
+        top = max(state["held"], key=lambda name: (EVENTS[name]["priority"], state["held"][name]))
         return f"hold:{top}", build_program(top, cfg)
     return "off", "off\n"
 
@@ -472,6 +498,14 @@ def render(state: dict, cfg: dict, now: float, force: bool = False,
     return key
 
 
+def hold_seconds(name: str, cfg: dict) -> int:
+    if name == "crash":
+        return cfg["crash_seconds"]
+    if name.endswith("-working"):
+        return min(cfg["working_seconds"], cfg["hold_max_seconds"])
+    return cfg["hold_max_seconds"]
+
+
 def apply(action: str, name: str, cfg: dict, now: float | None = None, draw: bool = True) -> str:
     """Record an event or clear. With draw=False only the state changes; the agent draws it."""
     now = time.time() if now is None else now
@@ -481,13 +515,19 @@ def apply(action: str, name: str, cfg: dict, now: float | None = None, draw: boo
             for cleared in ev.get("clears", ()):
                 state["held"].pop(cleared, None)
             if ev["kind"] == "hold":
-                limit = cfg["crash_seconds"] if name == "crash" else cfg["hold_max_seconds"]
-                state["held"][name] = now + limit
-                state["flash"] = None  # the newest state shows right away
+                if name not in state["held"]:
+                    state["flash"] = None  # a new state shows right away; a refresh lets a flash finish
+                state["held"][name] = now + hold_seconds(name, cfg)
             else:
                 state["flash"] = {"name": name, "start": now, "until": now + ev["seconds"]}
         else:
-            for held in HOLDS if name == "all" else [name]:
+            if name == "all":
+                targets = HOLDS
+            elif name in AGENTS:
+                targets = [f"{name}-input", f"{name}-working"]
+            else:
+                targets = [name]
+            for held in targets:
                 state["held"].pop(held, None)
             if name == "all":
                 state["flash"] = None
@@ -823,16 +863,105 @@ def gui_python() -> str:
     return str(exe)
 
 
-def copilot_hooks_json() -> str:
-    """Native `exec` hooks: Copilot starts Python directly, with no shell to quote for."""
+def shell_command(argv: list) -> str:
+    """Codex and Grok take a command line, not an argument list, and run it through a shell."""
+    if os.name != "nt":
+        return " ".join(shlex.quote(arg) for arg in argv)
+    if not all(WINDOWS_WORD_RE.match(arg) for arg in argv):  # cmd.exe and PowerShell quote differently
+        raise ValueError(f"needs Python and {SCRIPT.name} in folders without spaces or special characters")
+    return " ".join(argv)
+
+
+def agent_hooks(agent: str) -> dict:
+    """The agent's hook document. Copilot and Claude start Python directly (no shell to quote for)."""
     hooks = {}
-    for hook in COPILOT_HOOKS:
-        entry = {"type": "command", "exec": sys.executable,
-                 "args": ["-I", str(SCRIPT), "copilot", hook], "timeoutSec": 5}
-        if hook == "notification":
-            entry["matcher"] = COPILOT_INPUT_TYPES
-        hooks[hook] = [entry]
-    return json.dumps({"version": 1, "hooks": hooks}, indent=2) + "\n"
+    for key in AGENT_HOOKS[agent]:
+        argv = [sys.executable, "-I", str(SCRIPT), "hook", agent, key]
+        matcher = HOOK_MATCHERS.get(agent, {}).get(key)
+        if agent == "copilot":
+            entry = {"type": "command", "exec": argv[0], "args": argv[1:], "timeoutSec": 5}
+            hooks[key] = [{**entry, "matcher": matcher} if matcher else entry]
+            continue
+        if agent == "claude":
+            handler = {"type": "command", "command": argv[0], "args": argv[1:], "timeout": 5}
+        else:  # Codex allows Interrupt and SessionEnd hooks 3 s at most
+            handler = {"type": "command", "command": shell_command(argv),
+                       "timeout": 3 if agent == "chatgpt" else 5}
+        group = {"matcher": matcher, "hooks": [handler]} if matcher else {"hooks": [handler]}
+        hooks.setdefault("Notification" if key == "Idle" else key, []).append(group)
+    return {"version": 1, "hooks": hooks} if agent == "copilot" else {"hooks": hooks}
+
+
+def _json_text(doc: dict) -> str:
+    return json.dumps(doc, indent=2) + "\n"
+
+
+def _ours_handler(handler) -> bool:
+    return SCRIPT.name in json.dumps(handler)
+
+
+def strip_hooks(doc: dict) -> bool:
+    """Remove slidepulse's handlers from a hook file shared with other tools. True if any were."""
+    hooks = doc.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    removed = False
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for group in groups:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if isinstance(handlers, list) and any(_ours_handler(h) for h in handlers):
+                removed = True
+                handlers = [h for h in handlers if not _ours_handler(h)]
+                if not handlers:
+                    continue  # the group only held ours
+                group = {**group, "hooks": handlers}
+            kept.append(group)
+        if kept:
+            hooks[event] = kept
+        elif groups:
+            del hooks[event]
+    if removed and not hooks:
+        del doc["hooks"]
+    return removed
+
+
+def read_shared(path: Path) -> dict:
+    """A JSON hook file other tools also use. Raises ValueError rather than guess at its content."""
+    if not path.exists():
+        return {}
+    if path.stat().st_size > 4 * 1024 * 1024:
+        raise ValueError("is larger than 4 MB")
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValueError(f"is not valid JSON ({type(exc).__name__})") from None
+    if not isinstance(doc, dict) or not isinstance(doc.get("hooks", {}), dict):
+        raise ValueError("does not have the expected {\"hooks\": {...}} layout")
+    return doc
+
+
+def write_shared(path: Path, text: str) -> None:
+    """Replace the file in one step. A dotfiles symlink stays a link; its target is replaced."""
+    target = path.resolve() if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.slidepulse.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def merged_hooks(path: Path, agent: str) -> str:
+    doc = read_shared(path)
+    strip_hooks(doc)
+    for event, groups in agent_hooks(agent)["hooks"].items():
+        existing = doc.setdefault("hooks", {}).setdefault(event, [])
+        if not isinstance(existing, list):
+            raise ValueError(f"has a hooks.{event} entry that is not a list")
+        existing.extend(groups)
+    return _json_text(doc)
 
 
 def render_template(name: str, **values: str) -> str:
@@ -864,13 +993,31 @@ def studio_script(studio_dir: Path) -> Path:
     return studio_dir / "extensions" / "com.intellij" / "startup" / "slidepulse.groovy"
 
 
+def _home(variable: str, default: str) -> Path:
+    return Path(os.environ.get(variable) or Path.home() / default)
+
+
+def shared_hook_files() -> list:
+    """(label, file, agent): hook files other tools use too. slidepulse adds and removes its own entries."""
+    return [("Claude Code hooks", _home("CLAUDE_CONFIG_DIR", ".claude") / "settings.json", "claude"),
+            ("ChatGPT (Codex) hooks", _home("CODEX_HOME", ".codex") / "hooks.json", "chatgpt")]
+
+
+def _agent_file(agent: str):
+    try:
+        return _json_text(agent_hooks(agent))
+    except ValueError as exc:
+        return exc  # install reports it and skips this file
+
+
 def integration_files(studio_dir: Path | None) -> list:
-    """(label, destination, content) for every file `install` writes."""
-    copilot_home = Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot")
-    gradle_home = Path(os.environ.get("GRADLE_USER_HOME") or Path.home() / ".gradle")
+    """(label, destination, content) for every file `install` writes whole. Content may be a ValueError."""
+    gradle_home = _home("GRADLE_USER_HOME", ".gradle")
     build_hook = gradle_home / "slidepulse" / "build-done.gradle"
     files = [
-        ("Copilot CLI hooks", copilot_home / "hooks" / "slidepulse.json", copilot_hooks_json()),
+        ("Copilot CLI hooks", _home("COPILOT_HOME", ".copilot") / "hooks" / "slidepulse.json",
+         _agent_file("copilot")),
+        ("Grok hooks", _home("GROK_HOME", ".grok") / "hooks" / "slidepulse.json", _agent_file("grok")),
         ("Gradle init script", gradle_home / "init.d" / "slidepulse.gradle",
          render_template("gradle-init.gradle", HOOK=groovy_quote(str(build_hook)))),
         ("Gradle build hook", build_hook,
@@ -900,6 +1047,10 @@ def install(dry_run: bool, studio: str | None) -> int:
     studio_dir = Path(studio) if studio else (found[-1] if found else None)
     status = 0
     for label, dest, content in integration_files(studio_dir):
+        if isinstance(content, ValueError):
+            warn(f"{label} skipped: {content}")
+            status = 1
+            continue
         if dest.exists() and not _ours(dest):
             warn(f"{dest} exists and was not written by slidepulse; left unchanged")
             status = 1
@@ -908,11 +1059,22 @@ def install(dry_run: bool, studio: str | None) -> int:
         if not dry_run:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
+    for label, dest, agent in shared_hook_files():
+        try:
+            text = merged_hooks(dest, agent)
+        except (OSError, ValueError) as exc:
+            warn(f"{label} skipped: {dest} {exc}")
+            status = 1
+            continue
+        print(f"{'would add' if dry_run else 'added'} {label} to {dest}")
+        if not dry_run:
+            write_shared(dest, text)
     if not studio_dir:
         warn("no Android Studio settings folder found; pass --studio-dir to add the IDE bridge")
     if not dry_run:
-        print("\nNext: restart Android Studio, start a new Copilot CLI session, "
-              "then run `slidepulse.py demo` with the light plugged in.")
+        print("\nNext: restart Android Studio and start new Copilot, Claude Code, Codex and Grok sessions.\n"
+              "Codex runs new hooks only after you trust them: type /hooks in Codex and trust slidepulse.\n"
+              "Then run `slidepulse.py demo` with the light plugged in.")
     return status
 
 
@@ -924,6 +1086,18 @@ def uninstall(studio: str | None) -> int:
         if dest.exists() and _ours(dest):
             dest.unlink()
             print(f"removed {label}: {dest}")
+    for label, dest, _ in shared_hook_files():
+        try:
+            doc = read_shared(dest)
+        except (OSError, ValueError) as exc:
+            warn(f"{label}: {dest} {exc}; left unchanged")
+            continue
+        if strip_hooks(doc):
+            if doc:
+                write_shared(dest, _json_text(doc))
+            else:
+                dest.unlink()  # nothing but our hooks was in it
+            print(f"removed {label} from {dest}")
     stop_agent()
     return 0
 
@@ -958,9 +1132,11 @@ def cmd_demo(cfg: dict) -> int:
     if find_device(cfg) is None:
         warn("no device found; plug it in or set SLIDEPULSE_DEVICE")
         return 1
-    steps = [("event", "copilot-done", 3), ("event", "copilot-input", 4), ("clear", "copilot-input", 1),
-             ("event", "build-ok", 3), ("event", "build-failed", 3), ("event", "installed", 3),
-             ("event", "crash", 4), ("clear", "crash", 1), ("event", "breakpoint", 4), ("clear", "all", 0)]
+    steps = []
+    for agent in AGENTS:
+        steps += [("event", f"{agent}-working", 3), ("event", f"{agent}-input", 3), ("event", f"{agent}-done", 3)]
+    steps += [("event", "build-ok", 3), ("event", "build-failed", 3), ("event", "installed", 3),
+              ("event", "crash", 4), ("clear", "crash", 1), ("event", "breakpoint", 4), ("clear", "all", 0)]
     for action, name, pause in steps:
         print(f"{action} {name}")
         dispatch(action, name, cfg)
@@ -982,7 +1158,7 @@ def cmd_write(cfg: dict, program: str) -> int:
 
 
 def _drain_stdin():
-    """Copilot writes the hook payload to stdin. Read and discard it so its write never fails."""
+    """Agents write the hook payload to stdin. Read and discard it so their write never fails."""
     try:
         stream = sys.stdin.buffer
         if sys.stdin.isatty():
@@ -1005,8 +1181,12 @@ def main(argv=None) -> int:
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("event", help="trigger an event").add_argument("name", choices=list(EVENTS))
-    sub.add_parser("clear", help="end a held state").add_argument("name", choices=HOLDS + ["all"])
-    sub.add_parser("copilot", help="entry point for Copilot CLI hooks").add_argument("hook")
+    sub.add_parser("clear", help="end a held state, or all of an agent's").add_argument(
+        "name", choices=HOLDS + list(AGENTS) + ["all"])
+    p = sub.add_parser("hook", help="entry point for AI agent hooks")
+    p.add_argument("agent")
+    p.add_argument("hook")
+    sub.add_parser("copilot", help="Copilot hooks installed by slidepulse 1.1").add_argument("hook")
     sub.add_parser("write", help="write a raw LED program").add_argument("program")
     sub.add_parser("off", help="clear everything and switch the LEDs off")
     sub.add_parser("status", help="show device, agent and active states")
@@ -1015,28 +1195,38 @@ def main(argv=None) -> int:
     sub.add_parser("start", help="start the background agent if it is not running")
     sub.add_parser("stop", help="stop the background agent")
     for name in ("install", "uninstall"):
-        p = sub.add_parser(name, help=f"{name} the Copilot, Gradle and Android Studio integrations")
+        p = sub.add_parser(name, help=f"{name} the AI agent, Gradle and Android Studio integrations")
         p.add_argument("--studio-dir", help="Android Studio settings folder (default: newest found)")
         if name == "install":
             p.add_argument("--dry-run", action="store_true", help="only print what would be written")
-    args = parser.parse_args(argv)
+    words = sys.argv[1:] if argv is None else list(argv)
+    try:
+        args = parser.parse_args(words)
+    except SystemExit:
+        if words and words[0] in HOOK_COMMANDS:
+            return 0  # a hook never fails: exit code 2 would make Claude, Codex or Grok keep going
+        raise
 
     hook = args.command in HOOK_COMMANDS
     drain = None
     if hook:
-        # Hooks must never stall Copilot, Gradle or the IDE: hard exit after HOOK_DEADLINE.
+        # Hooks must never stall an agent, Gradle or the IDE: hard exit after HOOK_DEADLINE.
         watchdog = threading.Timer(HOOK_DEADLINE, os._exit, (0,))
         watchdog.daemon = True
         watchdog.start()
-        if args.command == "copilot":
+        if args.command in ("hook", "copilot"):
             drain = _drain_stdin()
     try:
         cfg = load_config()
         if hook:
-            if args.command == "copilot":
-                if args.hook not in COPILOT_HOOKS:
-                    return 0  # unknown hooks are ignored so Copilot never sees a failure
-                action, name = COPILOT_HOOKS[args.hook]
+            if args.command in ("hook", "copilot"):
+                agent = "copilot" if args.command == "copilot" else args.agent
+                if agent == "claude" and os.environ.get("GROK_HOOK_EVENT"):
+                    return 0  # Grok also runs Claude's hooks; its own slidepulse hooks report it
+                meaning = AGENT_HOOKS.get(agent, {}).get(args.hook)
+                if meaning is None:
+                    return 0  # unknown hooks are ignored so the agent never sees a failure
+                action, name = ("clear", agent) if meaning == "off" else ("event", f"{agent}-{meaning}")
             else:
                 action, name = args.command, args.name
             result = dispatch(action, name, cfg)
@@ -1076,6 +1266,10 @@ def main(argv=None) -> int:
     finally:
         if drain:
             drain.join(1.0)
+            if drain.is_alive():  # stdin left open: a normal shutdown would abort on the reader thread
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
     return 2
 
 
