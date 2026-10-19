@@ -1072,8 +1072,11 @@ def install(dry_run: bool, studio: str | None) -> int:
     if not studio_dir:
         warn("no Android Studio settings folder found; pass --studio-dir to add the IDE bridge")
     if not dry_run:
+        app_codex = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
+        codex = shutil.which("codex") or (str(app_codex) if app_codex.is_file() else "codex")
         print("\nNext: restart Android Studio and start new Copilot, Claude Code, Codex and Grok sessions.\n"
-              "Codex runs new hooks only after you trust them: type /hooks in Codex and trust slidepulse.\n"
+              f"Codex (also inside the ChatGPT app) skips hooks until you trust them: run {shlex.quote(codex)},\n"
+              "type /hooks and trust the slidepulse hooks.\n"
               "Then run `slidepulse.py demo` with the light plugged in.")
     return status
 

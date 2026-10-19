@@ -38,8 +38,11 @@ clears a crash.
    py -3.13 slidepulse.py install
    ```
 
-4. Restart Android Studio and start new agent sessions. In Codex, type `/hooks` once and trust
-   the slidepulse hooks; Codex skips hooks you have not trusted.
+4. Restart Android Studio and start new agent sessions. Codex skips hooks you have not trusted,
+   and the ChatGPT app does not ask: start the Codex CLI (on macOS the app's copy is
+   `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`), type `/hooks` and trust
+   the six slidepulse hooks. The app reads the same `~/.codex`, so this covers it too. Trust is
+   tied to each hook's exact command, so do it again after `install` from another folder or Python.
 
 `install` stores the absolute path of the Python that ran it, so use the Python
 you want to keep (3.9 or newer). Run `install` again after moving the folder.
