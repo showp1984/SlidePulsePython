@@ -36,8 +36,8 @@ abstract class SlidePulseBuildDone implements FlowAction<Params> {
             execOperations.exec { spec ->
                 spec.commandLine(params.command.get() + [outcome == 'ok' ? 'build-ok' : 'build-failed'])
                 spec.ignoreExitValue = true
-                spec.standardOutput = OutputStream.nullOutputStream()
-                spec.errorOutput = OutputStream.nullOutputStream()
+                spec.standardOutput = new ByteArrayOutputStream()  // also works on Java 8 daemons
+                spec.errorOutput = new ByteArrayOutputStream()
             }
         } catch (Exception ignored) {
             // The LED must never fail a build.
@@ -58,7 +58,11 @@ abstract class SlidePulseSettingsPlugin implements Plugin<Settings> {
         if (start.projectProperties.containsKey('android.injected.build.model.only')) {
             return
         }
-        if (!start.taskNames.any { it =~ /(?i)(assemble|bundle|build|install)/ }) {
+        // Match the task name itself (after the last ':'), e.g. assembleDebug, bundleRelease,
+        // installDebug, build. Not uninstallDebug, buildEnvironment or prepareKotlinBuildScriptModel.
+        if (!start.taskNames.any { String task ->
+            task.substring(task.lastIndexOf(':') + 1) ==~ /(assemble|bundle|install)(\p{Upper}\w*)?|build(Needed|Dependents)?/
+        }) {
             return
         }
         flowScope.always(SlidePulseBuildDone) { spec ->

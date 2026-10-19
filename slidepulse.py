@@ -4,8 +4,9 @@
 The device mounts as a tiny FAT drive. Writing a short text program to
 LEDS.LED on that drive changes the LEDs (format: LEDS_FORMAT.md in
 github.com/inteliwear/sidepulse). This is an independent implementation of
-that public file format: Python 3.9+, standard library only, no network
-access, no listening sockets, no shell commands.
+that public file format: Python 3.9+, standard library only, no shell
+commands, no listening sockets, and no network access beyond the local adb
+server.
 
     python slidepulse.py event build-ok      trigger an event
     python slidepulse.py clear breakpoint    end a held state
@@ -18,17 +19,19 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
-import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCRIPT = Path(__file__).resolve()
 HERE = SCRIPT.parent
 CONFIG_PATH = HERE / "config.json"
@@ -39,17 +42,19 @@ MAX_LINES = 20
 MAX_DEVICE_BYTES = 64 * 1024 * 1024  # the real volume is ~300 KB; refuse ordinary drives
 MAX_LED_FILE_BYTES = 64 * 1024
 LABEL_PREFIXES = ("SIDEPULS", "PULSEDOT")
+HOOK_DEADLINE = 3.0                  # hook processes always exit within this many seconds
+AGENT_TICK = 0.1
+AGENT_IDLE_EXIT = 1800               # agent exits after 30 idle minutes; the next event restarts it
 
 DEFAULTS = {
-    "device": None,           # drive/mount path or LEDS.LED path; None = auto-detect
+    "device": None,           # absolute drive/mount path or LEDS.LED path; None = auto-detect
     "brightness": 255,        # 1..255
     "colors": {"copilot": "#0064ff", "build": "#00e040", "alert": "#ff0000"},
-    "agent": True,            # start the background agent on demand (restore, expiry, crashes)
-    "crash_watch": True,      # agent follows `adb logcat -b crash` on connected devices
+    "agent": True,            # the background agent draws, restores, expires and watches crashes
+    "crash_watch": True,      # agent follows `logcat -b crash` through the running adb server
     "crash_seconds": 60,      # a crash stays visible this long unless a build/install clears it
     "crash_ignore": ["android.", "com.android.", "com.google.android.", "system_server"],
     "hold_max_seconds": 3600, # safety net: held states expire if nobody clears them
-    "adb": None,              # path to adb; None = Android SDK default locations, then PATH
     "keepalive": None,        # touch the drive every minute; None = only on macOS
 }
 
@@ -69,6 +74,7 @@ EVENTS = {
     "crash":         {"kind": "hold", "color": "alert", "style": "fast", "priority": 3},
 }
 HOLDS = [name for name, ev in EVENTS.items() if ev["kind"] == "hold"]
+HOOK_COMMANDS = ("event", "clear", "copilot")
 
 # Copilot CLI hook event -> slidepulse action. The installed `notification` hook has a
 # matcher, so it only fires for permission prompts and questions (elicitation dialogs).
@@ -77,13 +83,19 @@ COPILOT_HOOKS = {
     "notification": ("event", "copilot-input"),
     "userPromptSubmitted": ("clear", "copilot-input"),
     "postToolUse": ("clear", "copilot-input"),
+    "postToolUseFailure": ("clear", "copilot-input"),
     "sessionEnd": ("clear", "copilot-input"),
 }
 COPILOT_INPUT_TYPES = "permission_prompt|elicitation_dialog"
 
+# Environment the detached agent keeps. Tokens and passwords of whatever started it are dropped.
+AGENT_ENV = {"SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE",
+             "HOMEPATH", "LOCALAPPDATA", "APPDATA", "HOME", "USER", "LOGNAME", "LANG",
+             "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "ANDROID_ADB_SERVER_PORT",
+             "SLIDEPULSE_DEVICE", "SLIDEPULSE_STATE_DIR"}
+
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}\Z")
 PROGRAM_RE = re.compile(r"[A-Za-z0-9#:;./ \n-]*\Z")
-NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
 
 
 def warn(message: str) -> None:
@@ -98,8 +110,8 @@ def load_config() -> dict:
     if CONFIG_PATH.is_file():
         try:
             user = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            warn(f"ignoring {CONFIG_PATH.name}: {exc}")
+        except Exception as exc:  # unreadable, invalid or absurdly nested
+            warn(f"ignoring {CONFIG_PATH.name}: {type(exc).__name__}")
         if not isinstance(user, dict):
             warn(f"ignoring {CONFIG_PATH.name}: expected a JSON object")
             user = {}
@@ -115,15 +127,19 @@ def load_config() -> dict:
         elif _valid_setting(key, value):
             cfg[key] = value
         else:
-            warn(f"config {key}: invalid value {value!r}, using {DEFAULTS[key]!r}")
-    if os.environ.get("SLIDEPULSE_DEVICE"):
-        cfg["device"] = os.environ["SLIDEPULSE_DEVICE"]
+            warn(f"config {key}: invalid value, using {DEFAULTS[key]!r}")
+    env_device = os.environ.get("SLIDEPULSE_DEVICE")
+    if env_device:
+        if _valid_setting("device", env_device):
+            cfg["device"] = env_device
+        else:
+            warn("SLIDEPULSE_DEVICE must be an absolute path; ignored")
     return cfg
 
 
 def _valid_setting(key: str, value) -> bool:
-    if key in ("device", "adb"):
-        return value is None or (isinstance(value, str) and value.strip() != "")
+    if key == "device":
+        return value is None or (isinstance(value, str) and os.path.isabs(os.path.expanduser(value)))
     if key == "brightness":
         return type(value) is int and 1 <= value <= 255
     if key in ("crash_seconds", "hold_max_seconds"):
@@ -230,43 +246,58 @@ def _windows_fat_volumes():
                 yield Path(root), label.value
 
 
-def _check_target(led: Path) -> os.stat_result:
+def _check_target(led: Path) -> None:
     info = os.lstat(led)
     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
         raise OSError(f"{led} is a link; refusing to write through it")
     if not stat.S_ISREG(info.st_mode):
         raise OSError(f"{led} is not a regular file")
+    if info.st_nlink > 1:
+        raise OSError(f"{led} has several hard links; refusing to write")
     if info.st_size > MAX_LED_FILE_BYTES:
         raise OSError(f"{led} is too large to be a SidePulse control file")
-    return info
 
 
 def write_program(led: Path, program: str) -> None:
-    """Overwrite LEDS.LED in place. The file is never created, renamed or followed through a link."""
+    """Rewrite LEDS.LED in place. The file is never created, renamed or followed through a link."""
     data = validate(program)
-    checked = _check_target(led)
-    flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    _check_target(led)
+    flags = (os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     fd = os.open(led, flags)
     try:
-        opened = os.fstat(fd)
-        # st_ino is 0 when Windows cannot report a file index; then only the lstat checks apply.
-        if checked.st_ino and (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
-            raise OSError(f"{led} changed while it was being opened; not written")
+        os.ftruncate(fd, 0)  # same order as the documented `echo ... > LEDS.LED`
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
-        os.ftruncate(fd, len(data))
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
+def touch_keepalive(root: Path) -> None:
+    """The vendor's fix for MacBook readers that power the card off: touch a file once a minute."""
+    path = root / "keepalive"
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)))
+        return
+    if stat.S_ISREG(info.st_mode) and not getattr(info, "st_file_attributes", 0) & 0x400:
+        os.utime(path)
+
+
 # ----------------------------------------------------------------------------- state
 
 def state_dir() -> Path:
-    if os.environ.get("SLIDEPULSE_STATE_DIR"):
-        base = Path(os.environ["SLIDEPULSE_STATE_DIR"])
-    elif os.name == "nt":
+    override = os.environ.get("SLIDEPULSE_STATE_DIR")
+    if override:
+        base = Path(override)
+        if not base.is_absolute():
+            raise ValueError("SLIDEPULSE_STATE_DIR must be an absolute path")
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "slidepulse"
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "slidepulse"
@@ -303,7 +334,7 @@ class FileLock:
                 if time.monotonic() >= deadline:
                     handle.close()
                     return False
-                time.sleep(0.02)
+                time.sleep(0.01)
 
     def release(self) -> None:
         if self.handle is None:
@@ -321,24 +352,41 @@ class FileLock:
             self.handle = None
 
 
+def _empty_state() -> dict:
+    return {"held": {}, "flash": None, "shown": None}
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _read_state(path: Path) -> dict:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raw = {}
-    raw = raw if isinstance(raw, dict) else {}
-    held = raw.get("held") if isinstance(raw.get("held"), dict) else {}
-    flash = raw.get("flash") if isinstance(raw.get("flash"), dict) else None
-    if flash and not (flash.get("name") in EVENTS and all(
-            isinstance(flash.get(k), (int, float)) for k in ("start", "until"))):
-        flash = None
-    shown = raw.get("shown") if isinstance(raw.get("shown"), str) else None
-    return {"held": {k: float(v) for k, v in held.items() if k in HOLDS and isinstance(v, (int, float))},
-            "flash": flash, "shown": shown}
+        held = {name: float(until) for name, until in raw.get("held", {}).items()
+                if name in HOLDS and _number(until)}
+        flash = raw.get("flash")
+        if (isinstance(flash, dict) and isinstance(flash.get("name"), str)
+                and EVENTS.get(flash["name"], {}).get("kind") == "flash"
+                and _number(flash.get("start")) and _number(flash.get("until"))):
+            flash = {"name": flash["name"], "start": float(flash["start"]), "until": float(flash["until"])}
+        else:
+            flash = None
+        shown = raw.get("shown") if isinstance(raw.get("shown"), str) else None
+        return {"held": held, "flash": flash, "shown": shown}
+    except Exception:  # missing, corrupt or hostile: start clean
+        return _empty_state()
+
+
+def _mtime(path: Path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
 
 
 @contextlib.contextmanager
-def locked_state(timeout: float = 2.0):
+def locked_state(timeout: float = 2.0, meta: dict | None = None):
     folder = state_dir()
     lock = FileLock(folder / "state.lock")
     if not lock.acquire(timeout):
@@ -360,6 +408,8 @@ def locked_state(timeout: float = 2.0):
                     if attempt == 4:
                         raise
                     time.sleep(0.05)
+        if meta is not None:
+            meta["mtime"] = _mtime(path)  # read under the lock, so no other change hides behind it
     finally:
         lock.release()
 
@@ -376,23 +426,35 @@ def _desired(state: dict, cfg: dict, now: float):
     return "off", "off\n"
 
 
-def render(state: dict, cfg: dict, now: float, force: bool = False) -> str:
+def _next_deadline(state: dict, now: float) -> float:
+    times = list(state["held"].values()) + ([state["flash"]["until"]] if state["flash"] else [])
+    return min(times) if times else now + 60
+
+
+def render(state: dict, cfg: dict, now: float, force: bool = False,
+           led: Path | None = None, scan: bool = True) -> str:
     key, program = _desired(state, cfg, now)
     if key == state["shown"] and not force:
         return key
     if key == "off" and state["shown"] is None and not force:
         state["shown"] = key  # nothing to show and the device state is unknown: keep its INIT.LED
         return key
-    led = find_device(cfg)
+    if led is None and scan:
+        led = find_device(cfg)
     if led is None:
-        state["shown"] = None  # retried by the agent once the device appears
+        state["shown"] = None  # drawn once the device appears
         return "no device"
-    write_program(led, program)
+    try:
+        write_program(led, program)
+    except OSError as exc:
+        state["shown"] = "retry"  # the old program may still show; redraw even if it is just "off"
+        return f"write failed: {exc}"
     state["shown"] = key
     return key
 
 
-def apply(action: str, name: str, cfg: dict, now: float | None = None) -> str:
+def apply(action: str, name: str, cfg: dict, now: float | None = None, draw: bool = True) -> str:
+    """Record an event or clear. With draw=False only the state changes; the agent draws it."""
     now = time.time() if now is None else now
     with locked_state() as state:
         if action == "event":
@@ -410,7 +472,17 @@ def apply(action: str, name: str, cfg: dict, now: float | None = None) -> str:
                 state["held"].pop(held, None)
             if name == "all":
                 state["flash"] = None
-        return render(state, cfg, now)
+        return render(state, cfg, now) if draw else "recorded"
+
+
+def dispatch(action: str, name: str, cfg: dict) -> str:
+    """Hook entry: record the change; the agent draws it. Without an agent, draw here."""
+    use_agent = cfg["agent"] and not os.environ.get("SLIDEPULSE_NO_AGENT")
+    result = apply(action, name, cfg, draw=not use_agent)
+    if use_agent and not ensure_agent(cfg):
+        with locked_state() as state:
+            result = render(state, cfg, time.time())
+    return result
 
 
 # ----------------------------------------------------------------------------- agent
@@ -423,23 +495,29 @@ def agent_running() -> bool:
     return True
 
 
-def ensure_agent(cfg: dict) -> None:
-    if not cfg["agent"] or os.environ.get("SLIDEPULSE_NO_AGENT") or agent_running():
-        return
+def ensure_agent(cfg: dict) -> bool:
+    """Start the agent unless it runs already. Returns False if it cannot be started."""
+    if agent_running():
+        return True
     exe = Path(sys.executable)
     if os.name == "nt" and exe.with_name("pythonw.exe").is_file():
         exe = exe.with_name("pythonw.exe")  # no console window
     cmd = [str(exe), "-I", str(SCRIPT), "agent"]
     options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-               "stderr": subprocess.DEVNULL, "close_fds": True, "cwd": str(state_dir())}
-    if os.name == "nt":
-        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        try:  # leave the caller's job object so the agent outlives a hook runner
-            subprocess.Popen(cmd, creationflags=flags | 0x01000000, **options)
-        except OSError:
-            subprocess.Popen(cmd, creationflags=flags, **options)
-    else:
-        subprocess.Popen(cmd, start_new_session=True, **options)
+               "stderr": subprocess.DEVNULL, "close_fds": True, "cwd": str(state_dir()),
+               "env": {k: v for k, v in os.environ.items() if k.upper() in AGENT_ENV}}
+    try:
+        if os.name == "nt":
+            flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:  # leave the caller's job object so the agent outlives a hook runner
+                subprocess.Popen(cmd, creationflags=flags | 0x01000000, **options)
+            except OSError:
+                subprocess.Popen(cmd, creationflags=flags, **options)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **options)
+    except OSError:
+        return False
+    return True
 
 
 class AgentLog:
@@ -456,106 +534,148 @@ class AgentLog:
             pass
 
 
-def find_adb(cfg: dict) -> str | None:
-    exe = "adb.exe" if os.name == "nt" else "adb"
-    candidates = [Path(cfg["adb"]).expanduser()] if cfg["adb"] else []
-    for var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
-        if os.environ.get(var):
-            candidates.append(Path(os.environ[var]) / "platform-tools" / exe)
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
-        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk" / "platform-tools" / exe)
-    elif sys.platform == "darwin":
-        candidates.append(Path.home() / "Library" / "Android" / "sdk" / "platform-tools" / exe)
-    else:
-        candidates.append(Path.home() / "Android" / "Sdk" / "platform-tools" / exe)
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return shutil.which("adb")
+# The agent talks to the adb server that Android Studio already runs, using adb's documented
+# host protocol (SERVICES.TXT). It never runs or starts an adb binary, so it cannot restart a
+# server of a different version and drop Android Studio's device connections.
+
+def adb_port() -> int:
+    try:
+        port = int(os.environ.get("ANDROID_ADB_SERVER_PORT", "5037"))
+    except ValueError:
+        return 5037
+    return port if 0 < port < 65536 else 5037
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise OSError("adb server closed the connection")
+        data += chunk
+    return data
+
+
+def _adb_request(sock: socket.socket, request: str) -> None:
+    payload = request.encode("ascii")
+    sock.sendall(b"%04x" % len(payload) + payload)
+    if _recv_exact(sock, 4) != b"OKAY":
+        raise OSError(f"adb server refused {request.rsplit(':', 1)[0]}")
+
+
+def adb_devices(port: int) -> set:
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+        _adb_request(sock, "host:devices")
+        size = int(_recv_exact(sock, 4), 16)
+        text = _recv_exact(sock, min(size, 65536)).decode("utf-8", "replace") if size else ""
+    found = set()
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1] == "device" and CrashWatcher.SERIAL.match(parts[0]):
+            found.add(parts[0])
+    return found
+
+
+def adb_logcat(port: int, serial: str) -> socket.socket:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        _adb_request(sock, f"host:transport:{serial}")
+        _adb_request(sock, "shell:logcat -b crash -v brief -T 1")
+    except BaseException:
+        sock.close()
+        raise
+    sock.settimeout(None)
+    return sock
 
 
 class CrashWatcher:
-    """Follows `adb logcat -b crash` for every connected device and reports crashed apps."""
+    """Follows the crash log of every connected device and reports crashed apps."""
 
     JAVA = re.compile(r"Process: ([A-Za-z0-9_.:]+), PID: \d+")
+    TOMBSTONE = re.compile(r">>> ([A-Za-z0-9_.:]+) <<<")
     NATIVE = re.compile(r"Fatal signal \d+ .*?pid \d+ \(([^)\s]+)\)")
-    SERIAL = re.compile(r"[A-Za-z0-9._:-]+\Z")
+    SERIAL = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 
     def __init__(self, cfg: dict, log):
         import queue
-        self.adb = find_adb(cfg)
+        self.port = adb_port()
         self.ignore = tuple(cfg["crash_ignore"])
         self.log = log
-        self.procs = {}
+        self.streams = {}  # serial -> (socket, reader thread); changed only by the poll thread
         self.crashes = queue.Queue()
-        self.next_poll = 0.0
-        log(f"crash watcher using {self.adb or 'no adb found'}")
+        self.stopping = threading.Event()
+        self.thread = None
+
+    def start(self) -> None:
+        # Polls on its own thread: on Windows a refused local connection takes ~2 s,
+        # which must not delay drawing.
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stopping.is_set():
+            self.poll()
+            self.stopping.wait(5)
 
     def parse(self, line: str) -> str | None:
-        match = self.JAVA.search(line) or self.NATIVE.search(line)
-        if match and not match.group(1).startswith(self.ignore):
-            return match.group(1)
-        return None
+        match = self.JAVA.search(line) or self.TOMBSTONE.search(line)
+        if match:
+            app = match.group(1)
+        else:
+            match = self.NATIVE.search(line)
+            # That name is a thread name (15 characters at most) or a daemon path; apps have dots.
+            if not match or "." not in match.group(1) or match.group(1).startswith("/"):
+                return None
+            app = match.group(1)
+        return None if app.startswith(self.ignore) else app
 
-    def poll(self, now: float) -> None:
-        if not self.adb or now < self.next_poll:
+    def poll(self) -> None:
+        try:
+            serials = adb_devices(self.port)
+        except (OSError, ValueError):
+            serials = set()  # no adb server running: nothing to watch
+        if self.stopping.is_set():
             return
-        self.next_poll = now + 5
-        serials = self._devices() if self._server_up() else set()
-        for serial, proc in list(self.procs.items()):
-            if serial not in serials or proc.poll() is not None:
+        for serial, (_, reader) in list(self.streams.items()):
+            if serial not in serials or not reader.is_alive():
                 self._stop(serial)
-        for serial in serials - set(self.procs):
+        for serial in serials - set(self.streams):
             self._start(serial)
 
-    @staticmethod
-    def _server_up() -> bool:
-        # Only talk to an adb server that is already running; never start one ourselves.
-        import socket
-        try:
-            with socket.create_connection(("127.0.0.1", 5037), timeout=0.2):
-                return True
-        except OSError:
-            return False
-
-    def _devices(self) -> set:
-        try:
-            out = subprocess.run([self.adb, "devices"], capture_output=True, text=True,
-                                 timeout=5, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
-        except (OSError, subprocess.SubprocessError):
-            return set()
-        found = set()
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) == 2 and parts[1] == "device" and self.SERIAL.match(parts[0]):
-                found.add(parts[0])
-        return found
-
     def _start(self, serial: str) -> None:
-        import threading
         try:
-            proc = subprocess.Popen([self.adb, "-s", serial, "logcat", "-b", "crash", "-v", "brief", "-T", "1"],
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, errors="replace", **NO_WINDOW)
+            sock = adb_logcat(self.port, serial)
         except OSError as exc:
-            self.log(f"cannot start logcat for {serial}: {exc}")
+            self.log(f"cannot follow the crash log of {serial}: {exc}")
             return
-        self.procs[serial] = proc
-        threading.Thread(target=self._read, args=(proc,), daemon=True).start()
+        reader = threading.Thread(target=self._read, args=(sock,), daemon=True)
+        self.streams[serial] = (sock, reader)
+        reader.start()
         self.log(f"watching crashes on {serial}")
 
-    def _read(self, proc) -> None:
+    def _read(self, sock: socket.socket) -> None:
         backlog_until = time.monotonic() + 1.5  # `-T 1` first replays the newest old line
-        for line in proc.stdout:
-            if time.monotonic() >= backlog_until:
-                app = self.parse(line[:2000])
-                if app:
-                    self.crashes.put(app)
+        try:
+            with sock.makefile("rb") as stream:
+                while True:
+                    line = stream.readline(4096)
+                    if not line:
+                        break
+                    if time.monotonic() >= backlog_until:
+                        app = self.parse(line.decode("utf-8", "replace"))
+                        if app:
+                            self.crashes.put(app)
+        except (OSError, ValueError):
+            pass
 
     def _stop(self, serial: str) -> None:
-        proc = self.procs.pop(serial)
-        if proc.poll() is None:
-            proc.terminate()
+        sock, _ = self.streams.pop(serial)
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        sock.close()
+
+    def connected(self) -> bool:
+        return bool(self.streams)
 
     def take(self) -> list:
         apps = []
@@ -564,56 +684,88 @@ class CrashWatcher:
         return apps
 
     def close(self) -> None:
-        for serial in list(self.procs):
-            self._stop(serial)
+        self.stopping.set()
+        if self.thread:
+            self.thread.join(3)
+        for serial in list(self.streams):
+            with contextlib.suppress(KeyError):
+                self._stop(serial)
+
+
+def _release_if_idle(lock: FileLock) -> bool:
+    with locked_state(0.5) as state:
+        if state["held"] or state["flash"]:
+            return False
+        lock.release()  # from now on the next event starts a fresh agent
+        return True
 
 
 def run_agent(cfg: dict) -> int:
     folder = state_dir()
     lock = FileLock(folder / "agent.lock")
-    if not lock.acquire(0):
+    if not lock.acquire(1.0):  # status/stop probes hold the lock only for a moment
         print("agent already running")
         return 0
     stop_flag = folder / "agent.stop"
+    state_path = folder / "state.json"
     with contextlib.suppress(FileNotFoundError):
         stop_flag.unlink()
     (folder / "agent.pid").write_text(str(os.getpid()), encoding="ascii")
     log = AgentLog(folder / "agent.log")
     log(f"agent {VERSION} started (pid {os.getpid()})")
     watcher = CrashWatcher(cfg, log) if cfg["crash_watch"] else None
+    if watcher:
+        watcher.start()
     keepalive = cfg["keepalive"] if cfg["keepalive"] is not None else sys.platform == "darwin"
-    led = None
-    next_device_check = next_keepalive = last_crash = 0.0
+    led, redraw, pending_crash, meta, seen = None, False, None, {}, "unset"
+    next_check = next_due = next_keepalive = last_crash = 0.0
+    idle_since = time.time()
     try:
         while not stop_flag.exists():
             now = time.time()
             try:
                 if watcher:
-                    watcher.poll(now)
-                    for app in watcher.take():
-                        if now - last_crash > 3:  # one crash logs many lines
-                            log(f"crash: {app}")
-                            apply("event", "crash", cfg, now)
-                        last_crash = now
-                with locked_state(0.5) as state:
-                    if now >= next_device_check:
-                        # Cheap presence check of the known device; scan drives only while it is missing.
-                        if led is None or not led.is_file():
-                            led = find_device(cfg)
-                            if led is None:
-                                state["shown"] = None  # unplugged: redraw once it is back
-                        next_device_check = now + (2 if led else 5)
-                        if led and keepalive and now >= next_keepalive:
-                            next_keepalive = now + 60
-                            (led.parent / "keepalive").touch()
-                    render(state, cfg, now)
+                    apps = watcher.take()
+                    if apps and now - last_crash > 3:  # one crash logs several lines
+                        pending_crash = apps[0]
+                    if watcher.connected():
+                        idle_since = now
+                if pending_crash:
+                    apply("event", "crash", cfg, now, draw=False)  # retried next tick on timeout
+                    log(f"crash: {pending_crash}")
+                    pending_crash, last_crash = None, now
+                if now >= next_check:
+                    # Cheap presence check of the known device; scan drives only while it is missing.
+                    present = find_device(cfg) if led is None else (led if led.is_file() else None)
+                    next_check = now + (2 if present else 5)
+                    if present != led:
+                        led, redraw = present, True
+                        log(f"device found: {led}" if led else "device removed")
+                    if led and keepalive and now >= next_keepalive:
+                        next_keepalive = now + 60
+                        touch_keepalive(led.parent)
+                if redraw or now >= next_due or _mtime(state_path) != seen:
+                    with locked_state(0.5, meta) as state:
+                        if redraw:
+                            state["shown"] = None
+                        result = render(state, cfg, now, led=led, scan=False)
+                        next_due = _next_deadline(state, now)
+                        if state["held"] or state["flash"]:
+                            idle_since = now
+                    seen, redraw = meta.get("mtime"), False
+                    if result.startswith("write failed"):
+                        log(result)
+                        next_due = now + 5  # retry later instead of hammering the device
+                if now - idle_since > AGENT_IDLE_EXIT and _release_if_idle(lock):
+                    log("idle, exiting")
+                    break
             except TimeoutError:
                 pass
             except Exception as exc:  # keep running; the next tick retries
                 log(f"error: {exc!r}")
                 led = None
                 time.sleep(2)
-            time.sleep(0.25)
+            time.sleep(AGENT_TICK)
     finally:
         if watcher:
             watcher.close()
@@ -636,10 +788,6 @@ def stop_agent() -> bool:
 
 # ----------------------------------------------------------------------------- install
 
-def ps_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 def groovy_quote(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r")
     return "'" + escaped + "'"
@@ -657,13 +805,11 @@ def gui_python() -> str:
 
 
 def copilot_hooks_json() -> str:
+    """Native `exec` hooks: Copilot starts Python directly, with no shell to quote for."""
     hooks = {}
     for hook in COPILOT_HOOKS:
-        args = [sys.executable, "-I", str(SCRIPT), "copilot", hook]
-        entry = {"type": "command",
-                 "bash": " ".join(shlex.quote(a) for a in args),
-                 "powershell": "& " + " ".join(ps_quote(a) for a in args),
-                 "timeoutSec": 5}
+        entry = {"type": "command", "exec": sys.executable,
+                 "args": ["-I", str(SCRIPT), "copilot", hook], "timeoutSec": 5}
         if hook == "notification":
             entry["matcher"] = COPILOT_INPUT_TYPES
         hooks[hook] = [entry]
@@ -679,7 +825,8 @@ def render_template(name: str, **values: str) -> str:
     return text
 
 
-def studio_config_dir() -> Path | None:
+def studio_config_dirs() -> list:
+    """Android Studio settings folders, oldest first."""
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Google"
     elif sys.platform == "darwin":
@@ -690,8 +837,12 @@ def studio_config_dir() -> Path | None:
     def version(path: Path):
         return tuple(int(n) for n in re.findall(r"\d+", path.name))
 
-    dirs = [d for d in base.glob("AndroidStudio*") if d.is_dir() and "Preview" not in d.name]
-    return max(dirs, key=version) if dirs else None
+    return sorted((d for d in base.glob("AndroidStudio*") if d.is_dir() and "Preview" not in d.name),
+                  key=version)
+
+
+def studio_script(studio_dir: Path) -> Path:
+    return studio_dir / "extensions" / "com.intellij" / "startup" / "slidepulse.groovy"
 
 
 def integration_files(studio_dir: Path | None) -> list:
@@ -708,8 +859,7 @@ def integration_files(studio_dir: Path | None) -> list:
                          COMMAND=groovy_list([gui_python(), "-I", str(SCRIPT), "event"]))),
     ]
     if studio_dir:
-        files.append(("Android Studio startup script",
-                      studio_dir / "extensions" / "com.intellij" / "startup" / "slidepulse.groovy",
+        files.append(("Android Studio startup script", studio_script(studio_dir),
                       render_template("android-studio.groovy",
                                       COMMAND=groovy_list([gui_python(), "-I", str(SCRIPT)]))))
     return files
@@ -727,7 +877,8 @@ def install(dry_run: bool, studio: str | None) -> int:
     if sys.version_info < (3, 9):
         warn("Python 3.9 or newer is required")
         return 1
-    studio_dir = Path(studio) if studio else studio_config_dir()
+    found = studio_config_dirs()
+    studio_dir = Path(studio) if studio else (found[-1] if found else None)
     status = 0
     for label, dest, content in integration_files(studio_dir):
         if dest.exists() and not _ours(dest):
@@ -747,8 +898,10 @@ def install(dry_run: bool, studio: str | None) -> int:
 
 
 def uninstall(studio: str | None) -> int:
-    studio_dir = Path(studio) if studio else studio_config_dir()
-    for label, dest, _ in integration_files(studio_dir):
+    targets = [(label, dest) for label, dest, _ in integration_files(None)]
+    for folder in [Path(studio)] if studio else studio_config_dirs():  # upgrades copy the script along
+        targets.append(("Android Studio startup script", studio_script(folder)))
+    for label, dest in targets:
         if dest.exists() and _ours(dest):
             dest.unlink()
             print(f"removed {label}: {dest}")
@@ -766,12 +919,17 @@ def cmd_status(cfg: dict) -> int:
     pid = pid_file.read_text(encoding="ascii").strip() if pid_file.is_file() else "?"
     print(f"agent:   {f'running (pid {pid})' if agent_running() else 'stopped'}")
     with locked_state() as state:
-        _desired(state, cfg, time.time())
         now = time.time()
+        _desired(state, cfg, now)
         held = ", ".join(f"{n} ({int(t - now)} s left)" for n, t in state["held"].items()) or "none"
         print(f"showing: {state['shown'] or 'unknown'}")
         print(f"held:    {held}")
-    print(f"adb:     {find_adb(cfg) or 'not found'}")
+    port = adb_port()
+    try:
+        devices = ", ".join(sorted(adb_devices(port))) or "none"
+        print(f"adb:     server on port {port}, devices: {devices}")
+    except (OSError, ValueError):
+        print(f"adb:     no server on port {port}")
     print(f"config:  {CONFIG_PATH if CONFIG_PATH.is_file() else 'defaults (no config.json)'}")
     print(f"state:   {state_dir()}")
     return 0
@@ -783,11 +941,10 @@ def cmd_demo(cfg: dict) -> int:
         return 1
     steps = [("event", "copilot-done", 3), ("event", "copilot-input", 4), ("clear", "copilot-input", 1),
              ("event", "build-ok", 3), ("event", "build-failed", 3), ("event", "installed", 3),
-             ("event", "crash", 4),
-             ("clear", "crash", 1), ("event", "breakpoint", 4), ("clear", "all", 0)]
+             ("event", "crash", 4), ("clear", "crash", 1), ("event", "breakpoint", 4), ("clear", "all", 0)]
     for action, name, pause in steps:
         print(f"{action} {name}")
-        apply(action, name, cfg)
+        dispatch(action, name, cfg)
         time.sleep(pause)
     return 0
 
@@ -803,6 +960,25 @@ def cmd_write(cfg: dict, program: str) -> int:
         write_program(led, program)
         state["shown"] = _desired(state, cfg, time.time())[0]  # keep it until the state changes
     return 0
+
+
+def _drain_stdin():
+    """Copilot writes the hook payload to stdin. Read and discard it so its write never fails."""
+    try:
+        stream = sys.stdin.buffer
+        if sys.stdin.isatty():
+            return None
+    except (AttributeError, ValueError, OSError):
+        return None
+
+    def discard():
+        with contextlib.suppress(Exception):
+            while stream.read(65536):
+                pass
+
+    reader = threading.Thread(target=discard, daemon=True)
+    reader.start()
+    return reader
 
 
 def main(argv=None) -> int:
@@ -825,20 +1001,28 @@ def main(argv=None) -> int:
         if name == "install":
             p.add_argument("--dry-run", action="store_true", help="only print what would be written")
     args = parser.parse_args(argv)
-    cfg = load_config()
 
+    hook = args.command in HOOK_COMMANDS
+    drain = None
+    if hook:
+        # Hooks must never stall Copilot, Gradle or the IDE: hard exit after HOOK_DEADLINE.
+        watchdog = threading.Timer(HOOK_DEADLINE, os._exit, (0,))
+        watchdog.daemon = True
+        watchdog.start()
+        if args.command == "copilot":
+            drain = _drain_stdin()
     try:
-        if args.command in ("event", "clear", "copilot"):
+        cfg = load_config()
+        if hook:
             if args.command == "copilot":
                 if args.hook not in COPILOT_HOOKS:
                     return 0  # unknown hooks are ignored so Copilot never sees a failure
                 action, name = COPILOT_HOOKS[args.hook]
             else:
                 action, name = args.command, args.name
-            result = apply(action, name, cfg)
-            if result == "no device":
-                warn("no device found; the state is kept and shown once it is plugged in")
-            ensure_agent(cfg)
+            result = dispatch(action, name, cfg)
+            if result == "no device" or result.startswith("write failed"):
+                warn(f"{result}; the state is kept and shown once the device accepts it")
             return 0
         if args.command == "off":
             with locked_state() as state:
@@ -855,18 +1039,24 @@ def main(argv=None) -> int:
         if args.command == "agent":
             return run_agent(cfg)
         if args.command == "start":
-            ensure_agent(cfg)
-            return 0
+            return 0 if ensure_agent(cfg) else 1
         if args.command == "stop":
             return 0 if stop_agent() else 1
         if args.command == "install":
             return install(args.dry_run, args.studio_dir)
         if args.command == "uninstall":
             return uninstall(args.studio_dir)
-    except (OSError, ValueError, TimeoutError) as exc:
+    except Exception as exc:
+        if hook:
+            warn(f"{type(exc).__name__}: {exc}")
+            return 0  # hooks always succeed
+        if not isinstance(exc, (OSError, ValueError, TimeoutError)):
+            raise
         warn(str(exc))
-        # Hooks must never break Copilot, Gradle or the IDE: events always exit 0.
-        return 0 if args.command in ("event", "clear", "copilot") else 1
+        return 1
+    finally:
+        if drain:
+            drain.join(1.0)
     return 2
 
 

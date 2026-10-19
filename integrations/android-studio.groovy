@@ -3,7 +3,7 @@
 // This bridge only reads IDE state and starts slidepulse.py; it changes no projects or files:
 //   - debugger paused on a breakpoint -> `event breakpoint`, resumed or stopped -> `clear breakpoint`
 //   - "Install successfully finished" notification -> `event installed`
-//   - starts the slidepulse agent, which watches adb for app crashes
+//   - at startup `clear breakpoint`, which also starts the agent that watches for app crashes
 import com.intellij.notification.Notification
 import com.intellij.notification.Notifications
 import com.intellij.openapi.diagnostic.Logger
@@ -13,6 +13,7 @@ import com.intellij.util.concurrency.AppExecutorUtil
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebuggerManager
 
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 
 if (System.getProperty('slidepulse.bridge') != null) {
@@ -22,24 +23,35 @@ System.setProperty('slidepulse.bridge', 'on')
 
 Logger log = Logger.getInstance('slidepulse')
 List<String> base = {{COMMAND}}
+// One background thread runs the commands one after another, so they arrive in order
+// and never on the UI thread.
+ExecutorService sender = AppExecutorUtil.createBoundedApplicationPoolExecutor('slidepulse', 1)
 
 Closure send = { List<String> args ->
-    try {
-        Process process = new ProcessBuilder(base + args)
-                .redirectErrorStream(true)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .start()
-        process.outputStream.close()
-    } catch (Throwable t) {
-        log.warn("slidepulse: cannot run ${args}: ${t}")
-    }
+    sender.execute({
+        try {
+            Process process = new ProcessBuilder(base + args)
+                    .redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .start()
+            process.outputStream.close()
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+            }
+        } catch (Throwable t) {
+            log.warn("slidepulse: cannot run ${args}: ${t}")
+        }
+    } as Runnable)
 }
 
-Notifications installListener = [notify: { Notification notification ->
-    if ((notification.content ?: '').contains('Install successfully finished')) {
-        send(['event', 'installed'])
+Notifications installListener = new Notifications() {
+    @Override
+    void notify(Notification notification) {
+        if ((notification.content ?: '').contains('Install successfully finished')) {
+            send(['event', 'installed'])
+        }
     }
-}] as Notifications
+}
 
 Set<Project> watched = Collections.newSetFromMap(new WeakHashMap<Project, Boolean>())
 boolean paused = false
@@ -76,6 +88,6 @@ Runnable poll = {
     }
 } as Runnable
 
-send(['start'])
+send(['clear', 'breakpoint'])  // a breakpoint left over from a crashed IDE session
 AppExecutorUtil.getAppScheduledExecutorService().scheduleWithFixedDelay(poll, 2000, 300, TimeUnit.MILLISECONDS)
 log.info('slidepulse: Android Studio bridge started')

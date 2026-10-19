@@ -4,10 +4,12 @@ Run: python -m unittest discover -s tests
 """
 import importlib.util
 import json
+import socket
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -75,7 +77,8 @@ class ProgramTests(DeviceTestCase):
         self.assertFalse(sp._valid_setting("brightness", 0))
         self.assertFalse(sp._valid_setting("brightness", True))
         self.assertFalse(sp._valid_setting("crash_ignore", "android."))
-        self.assertTrue(sp._valid_setting("device", "E:\\"))
+        self.assertTrue(sp._valid_setting("device", str(self.device)))
+        self.assertFalse(sp._valid_setting("device", "relative\\SIDEPULSE"))
 
 
 class StateTests(DeviceTestCase):
@@ -133,6 +136,38 @@ class StateTests(DeviceTestCase):
         sp.apply("clear", "copilot-input", self.cfg, now=1000)
         self.assertEqual(self.shown(), "#ffffff\n")
 
+    def test_failed_write_keeps_state(self):
+        sp.apply("event", "breakpoint", self.cfg, now=1000)
+        os.chmod(self.led, 0o444)  # read-only, like a drive that is still being scanned
+        try:
+            self.assertTrue(sp.apply("clear", "breakpoint", self.cfg, now=1001).startswith("write failed"))
+        finally:
+            os.chmod(self.led, 0o666)
+        with sp.locked_state() as state:
+            self.assertEqual(state["held"], {})  # the clear was kept ...
+            sp.render(state, self.cfg, 1002)
+        self.assertEqual(self.shown(), "off\n")  # ... and drawn on the retry
+
+    def test_hostile_state_files_are_ignored(self):
+        path = sp.state_dir() / "state.json"
+        for text in ('{"flash": {"name": ["x"], "start": 1, "until": 2}}',
+                     '{"held": {"crash": ' + "9" * 400 + '}}',
+                     '{"held": {"crash": Infinity}}',
+                     '[' * 100000 + ']' * 100000,
+                     '{"held": []}', '"text"', '{not json'):
+            path.write_text(text, encoding="utf-8")
+            with sp.locked_state() as state:
+                self.assertEqual(state["held"], {})
+                self.assertIsNone(state["flash"])
+
+    def test_relative_state_dir_is_rejected(self):
+        os.environ["SLIDEPULSE_STATE_DIR"] = "relstate"
+        try:
+            with self.assertRaises(ValueError):
+                sp.state_dir()
+        finally:
+            os.environ["SLIDEPULSE_STATE_DIR"] = self.env["SLIDEPULSE_STATE_DIR"]
+
     def test_missing_device_keeps_state(self):
         self.led.unlink()
         self.assertEqual(sp.apply("event", "breakpoint", self.cfg, now=1000), "no device")
@@ -182,9 +217,7 @@ class WriteTests(DeviceTestCase):
 
 class CrashParserTests(unittest.TestCase):
     def setUp(self):
-        cfg = sp.load_config()
-        cfg["adb"] = None
-        self.watcher = sp.CrashWatcher(cfg, lambda message: None)
+        self.watcher = sp.CrashWatcher(sp.load_config(), lambda message: None)
 
     def test_java_crash(self):
         self.assertEqual(self.watcher.parse("E/AndroidRuntime( 4321): Process: com.example.app, PID: 4321"),
@@ -195,9 +228,95 @@ class CrashParserTests(unittest.TestCase):
                 "in tid 4321 (RenderThread), pid 4321 (com.example.app)")
         self.assertEqual(self.watcher.parse(line), "com.example.app")
 
+    def test_tombstone_names_the_full_package(self):
+        line = "F/DEBUG   ( 4400): pid: 4321, tid: 4321, name: example.app  >>> com.example.app <<<"
+        self.assertEqual(self.watcher.parse(line), "com.example.app")
+
     def test_system_crash_ignored(self):
         self.assertIsNone(self.watcher.parse("E/AndroidRuntime( 99): Process: com.android.systemui, PID: 99"))
         self.assertIsNone(self.watcher.parse("E/AndroidRuntime( 99): FATAL EXCEPTION: main"))
+
+    def test_native_daemon_crash_ignored(self):
+        for name in ("surfaceflinger", "/system/bin/cameraserver"):
+            line = f"F/libc    (  77): Fatal signal 6 (SIGABRT), code -1 in tid 77 (binder:77_2), pid 77 ({name})"
+            self.assertIsNone(self.watcher.parse(line), name)
+
+
+class FakeAdbServer:
+    """Speaks just enough of the adb host protocol: host:devices, host:transport, shell:."""
+
+    def __init__(self, crash_lines):
+        self.crash_lines = crash_lines
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen()
+        self.port = self.server.getsockname()[1]
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    @staticmethod
+    def request(conn):
+        size = int(conn.recv(4), 16)
+        return conn.recv(size).decode()
+
+    def serve(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    def handle(self, conn):
+        with conn:
+            request = self.request(conn)
+            if request == "host:devices":
+                body = b"emulator-5554\tdevice\nbad serial!\tdevice\n0123\toffline\n"
+                conn.sendall(b"OKAY" + b"%04x" % len(body) + body)
+            elif request == "host:transport:emulator-5554":
+                conn.sendall(b"OKAY")
+                if self.request(conn) == "shell:logcat -b crash -v brief -T 1":
+                    conn.sendall(b"OKAY")
+                    conn.sendall(b"E/AndroidRuntime(1): Process: com.old.backlog, PID: 1\r\n")
+                    time.sleep(2)
+                    conn.sendall(self.crash_lines)
+                    time.sleep(5)
+            else:
+                conn.sendall(b"FAIL")
+
+    def close(self):
+        self.server.close()
+
+
+class AdbTests(unittest.TestCase):
+    def setUp(self):
+        self.adb = FakeAdbServer(b"E/AndroidRuntime(42): FATAL EXCEPTION: main\r\n"
+                                 b"E/AndroidRuntime(42): Process: com.example.app, PID: 42\r\n")
+        os.environ["ANDROID_ADB_SERVER_PORT"] = str(self.adb.port)
+
+    def tearDown(self):
+        os.environ.pop("ANDROID_ADB_SERVER_PORT")
+        self.adb.close()
+
+    def test_devices_lists_only_ready_valid_serials(self):
+        self.assertEqual(sp.adb_devices(self.adb.port), {"emulator-5554"})
+
+    def test_crash_watcher_reports_new_crash_and_skips_backlog(self):
+        watcher = sp.CrashWatcher(sp.load_config(), lambda message: None)
+        try:
+            watcher.poll()
+            self.assertTrue(watcher.connected())
+            deadline, apps = time.monotonic() + 8, []
+            while not apps and time.monotonic() < deadline:
+                time.sleep(0.1)
+                apps = watcher.take()
+            self.assertEqual(apps, ["com.example.app"])
+        finally:
+            watcher.close()
+
+    def test_no_server_means_no_devices(self):
+        self.adb.close()
+        with self.assertRaises(OSError):
+            sp.adb_devices(self.adb.port)
 
 
 class InstallTests(DeviceTestCase):
@@ -207,12 +326,13 @@ class InstallTests(DeviceTestCase):
         self.assertEqual(set(doc["hooks"]), set(sp.COPILOT_HOOKS))
         notification = doc["hooks"]["notification"][0]
         self.assertEqual(notification["matcher"], "permission_prompt|elicitation_dialog")
-        self.assertTrue(notification["powershell"].startswith("& '"))
-        self.assertTrue(notification["powershell"].endswith("'copilot' 'notification'"))
+        self.assertEqual(notification["exec"], sys.executable)  # no shell, nothing to quote
+        self.assertEqual(notification["args"], ["-I", str(ROOT / "slidepulse.py"), "copilot", "notification"])
+        self.assertFalse({"bash", "powershell", "command"} & set(notification))
 
-    def test_quoting(self):
-        self.assertEqual(sp.ps_quote("C:\\it's"), "'C:\\it''s'")
+    def test_groovy_quoting(self):
         self.assertEqual(sp.groovy_quote("C:\\it's"), "'C:\\\\it\\'s'")
+        self.assertEqual(sp.groovy_quote("a\nb${x}"), "'a\\nb${x}'")  # single quotes: no interpolation
 
     def test_templates_fill_completely(self):
         for label, dest, content in sp.integration_files(Path(self.tmp.name) / "AndroidStudio2099.1"):
@@ -239,9 +359,16 @@ class InstallTests(DeviceTestCase):
 
 
 class CliTests(DeviceTestCase):
-    def run_cli(self, *args):
+    def run_cli(self, *args, env=None, stdin=None):
         return subprocess.run([sys.executable, "-I", str(ROOT / "slidepulse.py"), *args],
-                              capture_output=True, text=True, env={**os.environ, **self.env}, timeout=30)
+                              capture_output=True, text=True, env=env or {**os.environ, **self.env},
+                              input=stdin, timeout=30)
+
+    def wait_for_led(self, text, seconds=5.0):
+        deadline = time.monotonic() + seconds
+        while text not in self.shown() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIn(text, self.shown())
 
     def test_copilot_hook_exits_zero_even_without_device(self):
         self.led.unlink()
@@ -249,32 +376,38 @@ class CliTests(DeviceTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_cli("copilot", "someFutureHook").returncode, 0)
 
+    def test_copilot_hook_drains_a_large_payload_quickly(self):
+        started = time.monotonic()
+        result = self.run_cli("copilot", "postToolUse", stdin=json.dumps({"toolResult": "x" * 5_000_000}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, sp.HOOK_DEADLINE + 1)
+
+    def test_hook_survives_hostile_state_file(self):
+        (sp.state_dir() / "state.json").write_text("[" * 100000, encoding="utf-8")
+        self.assertEqual(self.run_cli("event", "breakpoint").returncode, 0)
+        self.assertIn("roll 1s linear", self.shown())
+
     def test_event_from_cli(self):
         self.assertEqual(self.run_cli("event", "breakpoint").returncode, 0)
         self.assertIn("roll 1s linear", self.shown())
         self.assertEqual(self.run_cli("clear", "breakpoint").returncode, 0)
         self.assertEqual(self.shown(), "off\n")
 
-    def test_agent_restores_held_state_after_flash(self):
+    def test_hook_starts_agent_which_draws_and_restores(self):
         env = {**os.environ, **self.env}
         env.pop("SLIDEPULSE_NO_AGENT")
-        self.assertEqual(self.run_cli("event", "breakpoint").returncode, 0)
-        agent = subprocess.Popen([sys.executable, "-I", str(ROOT / "slidepulse.py"), "agent"], env=env,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            deadline = time.monotonic() + 10
-            while not sp.agent_running() and time.monotonic() < deadline:
-                time.sleep(0.1)
+            self.assertEqual(self.run_cli("event", "breakpoint", env=env).returncode, 0)
+            self.wait_for_led("#ff0000 #4c0000")  # drawn by the agent the hook started
             self.assertTrue(sp.agent_running())
-            self.run_cli("event", "build-ok")
-            self.assertIn("#00e040 1s pulse", self.shown())
-            time.sleep(3)
-            self.assertIn("#ff0000 #4c0000", self.shown())  # back to the breakpoint light
-            self.assertEqual(self.run_cli("stop").returncode, 0)
-            agent.wait(timeout=10)
+            self.run_cli("event", "build-ok", env=env)
+            self.wait_for_led("#00e040 1s pulse", seconds=1)
+            self.wait_for_led("#ff0000 #4c0000", seconds=4)  # back to the breakpoint light
+            self.run_cli("clear", "breakpoint", env=env)
+            self.wait_for_led("off\n", seconds=1)
         finally:
-            if agent.poll() is None:
-                agent.kill()
+            self.assertEqual(self.run_cli("stop", env=env).returncode, 0)
+        self.assertFalse(sp.agent_running())
 
     def test_write_rejects_unsafe_program(self):
         result = self.run_cli("write", "#ff0000; $(calc)")
