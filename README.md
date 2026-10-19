@@ -7,12 +7,12 @@ Android Studio events. One Python file, standard library only.
 | Event | Detected from | Light |
 |---|---|---|
 | `copilot-done` | Copilot finished its turn (`agentStop` hook) | blue pulse, 2 s |
-| `copilot-input` | Copilot asks a question or needs a permission (`notification` hook) | blue running light until you answer |
+| `copilot-input` | Copilot asks a question or needs a permission (`notification` hook) | blue light sweeping back and forth until you answer |
 | `build-ok` | A Gradle build with an assemble/bundle/build/install task succeeded | green pulse, 2 s |
 | `build-failed` | Such a build failed (cancelled builds are ignored) | quick red blinks, 2 s |
-| `installed` | Android Studio reports "Install successfully finished" | green running light, 2 s |
+| `installed` | Android Studio reports "Install successfully finished" | green light sweeping there and back once, 2 s |
 | `crash` | The device crash log shows an app crash (Java or native) | fast red pulse until the next build/install (max 60 s) |
-| `breakpoint` | The Android Studio debugger is paused | red running light while paused |
+| `breakpoint` | The Android Studio debugger is paused | red light sweeping back and forth while paused |
 
 A 2-second flash plays over a held state and then returns to it. Held states
 rank crash > breakpoint > Copilot input. A finished turn clears "needs input",
@@ -156,7 +156,7 @@ dataflow actions, IntelliJ IDE startup scripts, and adb's host protocol.
 
 Tested:
 
-- 39 unit tests on Python 3.9 and 3.13 against a simulated device folder and a fake adb server:
+- 40 unit tests on Python 3.9 and 3.13 against a simulated device folder and a fake adb server:
   `py -3.13 -m unittest discover -s tests`. They cover the state machine, write safety, hostile
   state files, crash parsing and detection, the agent started by a hook, and large Copilot payloads.
 - Real builds on Gradle 9.4.1 and 8.14.4 with the configuration cache on: green on success

@@ -48,17 +48,33 @@ class DeviceTestCase(unittest.TestCase):
 
 class ProgramTests(DeviceTestCase):
     def test_every_event_builds_a_valid_program(self):
-        for name in sp.EVENTS:
-            data = sp.validate(sp.build_program(name, self.cfg))
-            self.assertLessEqual(len(data), sp.MAX_BYTES)
+        for brightness in (255, 100):  # a brightness line makes the program longer
+            self.cfg["brightness"] = brightness
+            for name in sp.EVENTS:
+                data = sp.validate(sp.build_program(name, self.cfg))
+                self.assertLessEqual(len(data), sp.MAX_BYTES)
 
     def test_expected_programs(self):
         self.assertEqual(sp.build_program("copilot-done", self.cfg),
                          "off\n#0064ff 1s pulse\nrepeat 2\noff\n")
-        self.assertEqual(sp.build_program("installed", self.cfg),
-                         "#00e040 #004313 #001205\nroll 1s linear\nrepeat 2\noff\n")
-        self.assertEqual(sp.build_program("breakpoint", self.cfg),
-                         "#ff0000 #4c0000 #140000\nroll 1s linear\nrepeat\n")
+        self.assertEqual(sp.build_program("breakpoint", self.cfg), "\n".join([
+            "#ff0000 #000000",
+            "0:#000000 125ms linear;1:#ff0000 250ms pulse;2:#ff0000 250ms pulse 125ms;"
+            "3:#ff0000 250ms pulse 250ms;4:#ff0000 250ms pulse 375ms;5:#ff0000 250ms pulse 500ms;"
+            "6:#ff0000 250ms pulse 625ms;7:#ff0000 125ms linear 750ms",
+            "7:#000000 125ms linear;6:#ff0000 250ms pulse;5:#ff0000 250ms pulse 125ms;"
+            "4:#ff0000 250ms pulse 250ms;3:#ff0000 250ms pulse 375ms;2:#ff0000 250ms pulse 500ms;"
+            "1:#ff0000 250ms pulse 625ms;0:#ff0000 125ms linear 750ms",
+            "repeat", ""]))
+        installed = sp.build_program("installed", self.cfg).split("\n")
+        self.assertEqual(installed[0], "#00e040 #000000")
+        self.assertEqual(installed[3:], ["repeat 1", "off", ""])  # one sweep there and back, 1.75 s
+
+    def test_running_light_goes_back_and_forth(self):
+        _, there, back, _ = sp.build_program("breakpoint", self.cfg).split("\n", 3)
+        order = lambda line: [int(seg.split(":")[0]) for seg in line.split(";")]
+        self.assertEqual(order(there), list(range(8)))
+        self.assertEqual(order(back), list(range(7, -1, -1)))
         self.assertEqual(sp.build_program("crash", self.cfg), "off\n#ff0000 300ms pulse\nrepeat\n")
         self.assertEqual(sp.build_program("build-failed", self.cfg),
                          "#ff0000 125ms none\noff 125ms none\nrepeat 8\noff\n")
@@ -91,12 +107,12 @@ class StateTests(DeviceTestCase):
 
     def test_flash_restores_held_state(self):
         sp.apply("event", "breakpoint", self.cfg, now=1000)
-        self.assertIn("#ff0000 #4c0000", self.shown())
+        self.assertIn("#ff0000 #000000", self.shown())
         sp.apply("event", "copilot-done", self.cfg, now=1001)
         self.assertIn("#0064ff 1s pulse", self.shown())
         with sp.locked_state() as state:
             sp.render(state, self.cfg, 1004)
-        self.assertIn("#ff0000 #4c0000", self.shown())
+        self.assertIn("#ff0000 #000000", self.shown())
 
     def test_priority_crash_over_breakpoint_over_input(self):
         sp.apply("event", "copilot-input", self.cfg, now=1000)
@@ -104,9 +120,9 @@ class StateTests(DeviceTestCase):
         sp.apply("event", "breakpoint", self.cfg, now=1002)
         self.assertIn("300ms pulse", self.shown())
         sp.apply("clear", "crash", self.cfg, now=1003)
-        self.assertIn("#ff0000 #4c0000", self.shown())
+        self.assertIn("#ff0000 #000000", self.shown())
         sp.apply("clear", "breakpoint", self.cfg, now=1004)
-        self.assertIn("#0064ff #001e4c", self.shown())
+        self.assertIn("#0064ff #000000", self.shown())
 
     def test_copilot_done_clears_input_and_build_clears_crash(self):
         sp.apply("event", "copilot-input", self.cfg, now=1000)
@@ -174,12 +190,12 @@ class StateTests(DeviceTestCase):
         self.led.write_bytes(b"")
         with sp.locked_state() as state:
             sp.render(state, self.cfg, 1001)
-        self.assertIn("#ff0000 #4c0000", self.shown())
+        self.assertIn("#ff0000 #000000", self.shown())
 
     def test_corrupt_state_file_is_ignored(self):
         (sp.state_dir() / "state.json").write_text("{not json", encoding="utf-8")
         sp.apply("event", "breakpoint", self.cfg, now=1000)
-        self.assertIn("roll", self.shown())
+        self.assertIn("250ms pulse 625ms", self.shown())
 
 
 class WriteTests(DeviceTestCase):
@@ -385,11 +401,11 @@ class CliTests(DeviceTestCase):
     def test_hook_survives_hostile_state_file(self):
         (sp.state_dir() / "state.json").write_text("[" * 100000, encoding="utf-8")
         self.assertEqual(self.run_cli("event", "breakpoint").returncode, 0)
-        self.assertIn("roll 1s linear", self.shown())
+        self.assertIn("250ms pulse 625ms", self.shown())
 
     def test_event_from_cli(self):
         self.assertEqual(self.run_cli("event", "breakpoint").returncode, 0)
-        self.assertIn("roll 1s linear", self.shown())
+        self.assertIn("250ms pulse 625ms", self.shown())
         self.assertEqual(self.run_cli("clear", "breakpoint").returncode, 0)
         self.assertEqual(self.shown(), "off\n")
 
@@ -398,11 +414,11 @@ class CliTests(DeviceTestCase):
         env.pop("SLIDEPULSE_NO_AGENT")
         try:
             self.assertEqual(self.run_cli("event", "breakpoint", env=env).returncode, 0)
-            self.wait_for_led("#ff0000 #4c0000")  # drawn by the agent the hook started
+            self.wait_for_led("#ff0000 #000000")  # drawn by the agent the hook started
             self.assertTrue(sp.agent_running())
             self.run_cli("event", "build-ok", env=env)
             self.wait_for_led("#00e040 1s pulse", seconds=1)
-            self.wait_for_led("#ff0000 #4c0000", seconds=4)  # back to the breakpoint light
+            self.wait_for_led("#ff0000 #000000", seconds=4)  # back to the breakpoint light
             self.run_cli("clear", "breakpoint", env=env)
             self.wait_for_led("off\n", seconds=1)
         finally:
